@@ -1,72 +1,106 @@
 # DocuMind - Product Documentation Assistant
 
-An Azure-backed RAG application that lets users upload product documentation and ask grounded questions about it. The current implementation uses FastAPI, React/Vite, Azure OpenAI, Azure AI Search, Azure AI Document Intelligence, and optional Azure Blob Storage.
+DocuMind is an Azure-backed retrieval-augmented generation (RAG) application for asking questions about product documentation. Users upload a product manual in the React web application, the FastAPI backend extracts and indexes it in Azure, and Azure OpenAI answers questions using retrieved documentation as evidence.
 
-## What the application does
+The project is designed for local development with Azure API keys and connection strings. It does not use Azure CLI login, `DefaultAzureCredential`, Microsoft login popups, Foundry Agent Service, or local persistence of web-uploaded documents.
+
+## What the application provides
+
+- Upload a PDF product manual from the browser.
+- Store uploaded source documents in Azure Blob Storage.
+- Extract page-aware PDF text with Azure AI Document Intelligence.
+- Split extracted content into overlapping chunks.
+- Generate vector embeddings with Azure OpenAI.
+- Store keyword fields and vectors in Azure AI Search.
+- Ask questions through an application-managed Azure OpenAI tool-calling agent.
+- Return grounded answers with links to source documents and page metadata.
+- Show backend status, document names, and indexed chunk counts in the UI.
+
+The web interface accepts PDF files up to 25 MB. The backend API and batch ingestion command also support `.md` and `.txt` files.
+
+## Architecture
 
 ```text
-PDF upload
-   ↓
-FastAPI receives and stores the PDF
-   ↓
-Azure Blob Storage stores the original (when configured)
-   ↓
-Azure AI Document Intelligence extracts page-aware content
-   ↓
-Text is chunked
-   ↓
-Azure OpenAI creates embeddings
-   ↓
-Azure AI Search stores keyword + vector representations
-   ↓
-User asks a question
-   ↓
-Azure OpenAI agent calls the Search tool
-   ↓
-Azure AI Search retrieves relevant chunks
-   ↓
-Azure OpenAI generates a grounded answer
-   ↓
-Sources are returned to the frontend
+Browser (React + Vite)
+        |
+        | POST /api/documents with PDF bytes
+        v
+FastAPI backend
+        |
+        | validate file and keep upload in memory
+        | ensure Azure AI Search index exists
+        |
+        +--> Azure AI Document Intelligence
+        |        prebuilt-layout PDF extraction
+        |
+        +--> Azure Blob Storage
+        |        original source document
+        |
+        +--> Azure OpenAI embeddings
+        |        batched chunk embeddings
+        |
+        +--> Azure AI Search
+                 keyword fields + 1536-dimensional vectors
+
+Browser question
+        |
+        v
+FastAPI /api/chat
+        |
+        v
+Azure OpenAI Responses API agent
+        |
+        | calls search_product_documentation(query)
+        v
+Azure AI Search hybrid retrieval
+        |
+        | relevant chunks and source metadata
+        v
+Azure OpenAI grounded answer
+        |
+        v
+React chat with citations
 ```
 
-## Authentication model
+### Document ingestion flow
 
-This version intentionally does **not** use:
+1. The browser validates that the selected file is a PDF smaller than 25 MB.
+2. The frontend sends the file as multipart form data to `POST /api/documents` and passes its filename in the `X-File-Name` header.
+3. FastAPI validates the extension and size. It does not write the web upload to the project directory.
+4. The backend creates the Search index if it does not already exist.
+5. PDF bytes are sent to Azure AI Document Intelligence using `prebuilt-layout`. Extracted text keeps page numbers for citations.
+6. The original bytes are uploaded to the configured Azure Blob Storage container.
+7. Each page is split into chunks using `CHUNK_SIZE` and `CHUNK_OVERLAP`.
+8. Azure OpenAI creates embeddings in batches of 64 chunks.
+9. Chunks and embeddings are uploaded to Azure AI Search in batches of up to 500 documents.
+10. The API returns the indexed chunk count. Source links use FastAPI, which streams the document from Blob Storage.
 
-- Azure CLI
-- `az login`
-- `DefaultAzureCredential`
-- Microsoft login browser popups
-- `AIProjectClient`
-- Foundry Agent Service managed-agent authentication
+### Question-answering flow
 
-It uses API keys/connection strings for local development:
+1. The browser sends the question and up to the last eight chat messages to `POST /api/chat`.
+2. The backend sends the question to Azure OpenAI through the Responses API.
+3. The model can call `search_product_documentation`.
+4. The function creates a question embedding and performs hybrid Azure AI Search retrieval using keyword and vector search.
+5. Retrieved chunks are returned to the model as tool output.
+6. The model answers from the retrieved evidence and includes source references.
+7. The backend returns the answer and deduplicated citation URLs to React.
 
-- Azure OpenAI API key
-- Azure AI Search admin/query API key
-- Azure AI Document Intelligence API key
-- Azure Storage connection string
-
-The agent itself is implemented by the FastAPI application using Azure OpenAI Responses API tool/function calling. It searches Azure AI Search with keyword and vector retrieval before generating an answer and citations.
-
-## Project structure
+## Repository layout
 
 ```text
 product-doc-assistant/
-├── .env                         # local credentials; never commit
-├── .env.example                 # configuration template
+├── .env.example                 # local configuration template
 ├── .gitignore
 ├── README.md
 ├── data/
 │   ├── sample_product_manual_v1.md
-│   └── uploads/
+│   └── uploads/                  # ignored; not used by browser uploads
 ├── backend/
 │   ├── __init__.py
-│   ├── app.py
-│   ├── azure_services.py
-│   ├── config.py
-│   ├── ingest.py
+│   ├── app.py                   # FastAPI routes and application startup
+│   ├── azure_services.py        # Azure clients, Search, Blob, embeddings, agent
+│   ├── config.py                # environment-backed settings
+│   ├── ingest.py                # extraction, chunking, and ingestion pipeline
 │   └── requirements.txt
 └── frontend/
     ├── .env.example
@@ -74,128 +108,251 @@ product-doc-assistant/
     ├── package.json
     ├── vite.config.js
     └── src/
-        ├── App.jsx
+        ├── App.jsx              # upload, status, chat, and citation UI
         ├── main.jsx
         └── styles.css
 ```
 
-## 1. Configure the environment
+## Azure prerequisites
 
-Copy `.env.example` to `.env` and fill in the Azure resource values. The required settings are:
+Create or obtain these Azure resources before starting:
 
-- `AZURE_OPENAI_ENDPOINT`
-- `AZURE_OPENAI_KEY`
-- `AZURE_OPENAI_CHAT_DEPLOYMENT`
-- `AZURE_OPENAI_EMBEDDING_DEPLOYMENT`
-- `AZURE_SEARCH_ENDPOINT`
-- `AZURE_SEARCH_API_KEY`
-- `AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT`
-- `AZURE_DOCUMENT_INTELLIGENCE_KEY`
+1. **Azure OpenAI** with a chat deployment such as `gpt-4.1-mini` and an embedding deployment such as `text-embedding-3-small`. The embedding deployment must return 1536 dimensions to match the Search schema.
+2. **Azure AI Search** with a service endpoint and admin/indexing API key. The application creates the vector-enabled index automatically when it does not exist.
+3. **Azure AI Document Intelligence** with an endpoint and API key. It extracts PDFs with `prebuilt-layout`.
+4. **Azure Blob Storage** with a connection string and container name. This is required because web-uploaded documents are stored in Azure and not in the local project.
 
-The embedding deployment must produce **1536 dimensions** for the supplied Search schema. `text-embedding-3-small` does this by default.
+The application uses API keys and a storage connection string for local development. For production, use managed identity/RBAC and a secret manager where possible.
 
-`AZURE_STORAGE_CONNECTION_STRING` is required. Uploaded documents are written to Azure Blob Storage and are never persisted in the local project. The FastAPI document endpoint streams source files from Azure for citations. Do not commit `.env` to Git, and rotate any credentials that have been exposed.
+## Configuration
 
-## 2. Backend
-
-From the project root:
+From the repository root, copy the template:
 
 ```powershell
-cd backend
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install -r requirements.txt
+Copy-Item .env.example .env
 ```
 
-Start FastAPI from the project root:
+Fill in the required values:
+
+```env
+AZURE_OPENAI_ENDPOINT=https://your-openai-resource.openai.azure.com
+AZURE_OPENAI_KEY=your-openai-key
+AZURE_OPENAI_CHAT_DEPLOYMENT=gpt-4.1-mini
+AZURE_OPENAI_EMBEDDING_DEPLOYMENT=text-embedding-3-small
+
+AZURE_SEARCH_ENDPOINT=https://your-search-service.search.windows.net
+AZURE_SEARCH_API_KEY=your-search-admin-key
+AZURE_SEARCH_INDEX_NAME=product-docs
+
+AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT=https://your-document-intelligence.cognitiveservices.azure.com
+AZURE_DOCUMENT_INTELLIGENCE_KEY=your-document-intelligence-key
+
+AZURE_STORAGE_CONNECTION_STRING=your-storage-connection-string
+AZURE_STORAGE_CONTAINER=product-documents
+```
+
+Other settings control local URLs and RAG behavior:
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `PUBLIC_APP_URL` | `http://localhost:8000` | Base URL used in citation links |
+| `FRONTEND_ORIGIN` | `http://localhost:5173` | Allowed browser origin for CORS |
+| `SEARCH_TOP_K` | `5` | Number of Search results per query |
+| `CHUNK_SIZE` | `1400` | Approximate characters per chunk |
+| `CHUNK_OVERLAP` | `180` | Overlap between chunks on a page |
+
+Never commit `.env`. The repository ignores it, and credentials must remain server-side.
+
+## Run locally
+
+### Backend
+
+From the repository root in PowerShell:
 
 ```powershell
-cd ..
+python -m venv backend\.venv
+backend\.venv\Scripts\Activate.ps1
+python -m pip install -r backend\requirements.txt
 python -m uvicorn backend.app:app --reload --port 8000
 ```
 
-Health check:
+The backend is available at `http://localhost:8000`. Interactive API documentation is available at `http://localhost:8000/docs`.
 
-```text
-http://localhost:8000/api/health
-```
-
-## 3. Frontend
-
-Open another terminal:
+If PowerShell blocks activation for the current session:
 
 ```powershell
-cd frontend
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy RemoteSigned
+backend\.venv\Scripts\Activate.ps1
+```
+
+### Frontend
+
+Open a second terminal:
+
+```powershell
+Set-Location frontend
 npm install
 npm run dev
 ```
 
-Open:
+Open `http://localhost:5173`. The frontend uses `http://localhost:8000` by default. To use another backend, create `frontend/.env`:
 
-```text
-http://localhost:5173
+```env
+VITE_API_URL=http://localhost:8000
 ```
 
-## 4. Normal workflow
+Start the backend before the frontend so the status indicator can connect.
 
-1. Open the frontend.
-2. Drop a PDF product manual into the upload area. The UI accepts PDFs up to 25 MB.
-3. FastAPI stores the file in Azure Blob Storage; it does not write the upload to local disk.
-4. Document Intelligence extracts page-aware PDF text using `prebuilt-layout`.
-5. The backend creates chunks and embeddings.
-6. Chunks are indexed into Azure AI Search.
-7. The UI shows the indexed chunk count.
-8. Ask a product question.
-9. The AI agent searches the documentation and answers from retrieved evidence.
-10. Source links point back to the uploaded document served by FastAPI.
+### Production frontend build
 
-Markdown and plain-text files are also supported by the backend upload endpoint and batch ingestion command, even though the current UI is intentionally limited to PDFs.
+```powershell
+Set-Location frontend
+npm run build
+npm run preview
+```
 
-## 5. API endpoints
+The output is written to `frontend/dist/`, which is ignored by Git.
 
-- `GET /api/health` — backend/Search status
-- `GET /api/documents` — uploaded documents and indexed chunk count
-- `POST /api/documents` — upload and index a PDF, Markdown, or text file; rejects files over 25 MB
-- `GET /api/documents/{filename}` — open an uploaded source document
-- `POST /api/chat` — ask a grounded question
+## Use the application
 
-## 6. Batch ingestion
+1. Start the backend and frontend.
+2. Open `http://localhost:5173`.
+3. Drop a PDF into the upload area or choose a PDF file.
+4. Wait for extraction, embedding, and Search indexing to finish.
+5. Confirm that the knowledge base shows an indexed chunk count.
+6. Ask a specific question about setup, features, specifications, limits, or troubleshooting.
+7. Open returned citation links to inspect the source document.
 
-You normally do **not** need to run a separate ingestion command. Uploading a document through the frontend calls `/api/documents`, which creates the Search index if needed and performs the complete ingestion flow.
+Example questions:
 
-The older `backend/ingest.py` command is still available for batch ingestion of source files already placed in `data/`. It reads those source files locally, then sends their contents to Azure; web uploads do not use this local-source path.
+- What are the main product features?
+- What are the key specifications?
+- How do I set up the product?
+- What does error E104 mean?
+- Does the documentation say the device supports Wi-Fi 7?
+
+The assistant is instructed to say when the indexed documentation does not provide enough evidence. It should not be treated as a general-purpose assistant for facts outside the uploaded documentation.
+
+## API reference
+
+### `GET /api/health`
+
+Returns backend status, Search connectivity, indexed chunk count, and storage mode.
+
+```json
+{
+  "status": "ok",
+  "search": "ok",
+  "indexed_chunks": 12,
+  "storage": "azure-blob"
+}
+```
+
+### `GET /api/documents`
+
+Lists PDF, Markdown, and text documents in the configured Blob Storage container and returns the current Search document count.
+
+### `POST /api/documents`
+
+Uploads and indexes a document. The request is multipart form data with a `file` field and should include the original filename in `X-File-Name`.
+
+Supported extensions are `.pdf`, `.md`, and `.txt`. The maximum size is 25 MB.
+
+```powershell
+curl.exe -X POST http://localhost:8000/api/documents `
+  -H "X-File-Name: sample_product_manual_v1.md" `
+  -F "file=@data/sample_product_manual_v1.md"
+```
+
+### `GET /api/documents/{filename}`
+
+Streams a source document from Azure Blob Storage through FastAPI. The backend reduces the requested name to its filename component before accessing Blob Storage.
+
+### `POST /api/chat`
+
+Accepts a question and optional conversation history:
+
+```json
+{
+  "question": "How do I reset the device?",
+  "history": [
+    {"role": "user", "content": "What is the device?"},
+    {"role": "assistant", "content": "..."}
+  ]
+}
+```
+
+The response includes `answer`, `citations`, and the active `mode`.
+
+## Batch ingestion
+
+Browser uploads use the Azure-backed web path. For local development or repeatable seed data, `backend/ingest.py` can read supported files from `data/` and send their contents to Azure:
 
 ```powershell
 python -m backend.ingest
 ```
 
-## 7. Troubleshooting
+The command creates the Search index if necessary and ingests every `.pdf`, `.md`, and `.txt` file under `data/`. Local files are batch inputs only; the source document is uploaded to Blob Storage and indexed content is stored in Azure.
 
-### Microsoft login page appears
+## Performance notes
 
-This project should not invoke Azure CLI or `DefaultAzureCredential`. Check that you are running the new `backend/azure_services.py` and `backend/ingest.py` from this package.
+PDF ingestion is synchronous from the browser's perspective: the upload request completes only after extraction, embedding, and indexing finish. The implementation reduces processing time by:
 
-### Upload says Document Intelligence authentication failed
+- Sending PDF bytes directly to Azure services without writing a web upload to local disk.
+- Creating the Search index only when it is missing.
+- Generating embeddings in batches of 64 chunks.
+- Uploading Search documents in batches of up to 500.
 
-Check:
+For larger production workloads, move ingestion to a background queue and return a job ID immediately. Azure Functions, Azure Container Apps jobs, or a queue-backed worker are suitable next steps.
+
+## Troubleshooting
+
+### Backend exits during startup
+
+`AzureServices` validates required credentials at startup. Check that all required variables in `.env` are populated, especially `AZURE_STORAGE_CONNECTION_STRING`.
+
+### Upload fails with a Document Intelligence error
+
+Check the endpoint and key:
 
 ```env
 AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT=...
 AZURE_DOCUMENT_INTELLIGENCE_KEY=...
 ```
 
-### Search returns zero chunks
+Also confirm that the resource is available and that the uploaded file is a readable PDF.
 
-Check the upload response. A successful upload returns a `chunks` value. Also open `/api/health` and confirm `indexed_chunks` is greater than zero. The Search index name defaults to `product-docs` and can be changed with `AZURE_SEARCH_INDEX_NAME`.
+### Upload succeeds but no chunks are indexed
 
-### Frontend cannot connect
+Inspect the upload response and call `/api/health`. Confirm that:
 
-Start FastAPI first on port 8000, then Vite on port 5173. `frontend/.env` can override the backend URL:
+- `indexed_chunks` is greater than zero.
+- The embedding deployment returns 1536-dimensional vectors.
+- The Search key can create indexes and upload documents.
+- The Search endpoint and index name are correct.
 
-```env
-VITE_API_URL=http://localhost:8000
-```
+### Frontend reports that the backend is offline
 
-## 8. Notes for production
+Start FastAPI on port 8000, check `http://localhost:8000/api/health`, and verify `VITE_API_URL` if the backend is elsewhere. Confirm that `FRONTEND_ORIGIN` matches the browser origin.
 
-This is a local-development reference implementation. Before deploying it, add authentication and authorization, validate document ownership, move ingestion to a background job, add request and upload rate limits, and protect uploaded-document URLs. Keep all Azure credentials on the backend.
+### Azure Blob Storage documents are not visible
+
+Confirm that the connection string is valid, the container name matches `AZURE_STORAGE_CONTAINER`, and the storage account allows the application to create containers and upload/read blobs.
+
+## Security and production considerations
+
+This repository is a local-development reference implementation. Before exposing it publicly:
+
+- Add user authentication and authorization.
+- Restrict documents and citations to the owning user or tenant.
+- Replace API keys and connection strings with managed identity/RBAC and a secret manager.
+- Move ingestion to an asynchronous worker with job status tracking.
+- Add upload, chat, and Search rate limits.
+- Add file validation, malware scanning, and stricter filename/document metadata validation.
+- Protect the document download endpoint and avoid unrestricted source URLs.
+- Add structured logging, monitoring, retries, and retrieval-quality evaluation.
+- Review prompt-injection risks in uploaded documents and treat retrieved text as untrusted input.
+
+## License
+
+No license has been declared for this repository. Add a license file before distributing the project.
