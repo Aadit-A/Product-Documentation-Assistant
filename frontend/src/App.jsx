@@ -10,6 +10,7 @@ function App() {
   const [status, setStatus] = useState({ backend: "checking", indexed: 0, documents: [] });
   const [notice, setNotice] = useState(null);
   const [dragging, setDragging] = useState(false);
+  const [deletingDocument, setDeletingDocument] = useState(null);
   const fileInput = useRef(null);
 
   async function refreshStatus() {
@@ -71,6 +72,26 @@ function App() {
     const file = event.target.files?.[0];
     event.target.value = "";
     uploadFile(file);
+  }
+
+  async function deleteDocument(name) {
+    if (!window.confirm(`Delete ${name} and its indexed chunks?`)) return;
+
+    setDeletingDocument(name);
+    setNotice({ type: "info", text: `Deleting ${name} from Azure Storage and Search…` });
+
+    try {
+      const response = await fetch(`${API}/api/documents/${encodeURIComponent(name)}`, { method: "DELETE" });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.detail || "Document deletion failed");
+      setNotice({ type: "success", text: `${name} and ${data.deleted_chunks} indexed chunks were deleted.` });
+      setMessages([]);
+      await refreshStatus();
+    } catch (error) {
+      setNotice({ type: "error", text: error.message });
+    } finally {
+      setDeletingDocument(null);
+    }
   }
 
   async function sendMessage(text = question) {
@@ -181,10 +202,22 @@ function App() {
               ) : (
                 <div className="doc-list">
                   {status.documents.map((doc) => (
-                    <a key={doc.name} href={doc.url} target="_blank" rel="noreferrer" className="doc-item">
-                      <span className="pdf-label">PDF</span>
-                      <span className="doc-name">{doc.name}</span>
-                    </a>
+                    <div key={doc.name} className="doc-item">
+                      <a href={doc.url} target="_blank" rel="noreferrer" className="doc-link">
+                        <span className="pdf-label">PDF</span>
+                        <span className="doc-name">{doc.name}</span>
+                      </a>
+                      <button
+                        type="button"
+                        className="delete-document"
+                        aria-label={`Delete ${doc.name}`}
+                        title={`Delete ${doc.name}`}
+                        disabled={deletingDocument !== null}
+                        onClick={() => deleteDocument(doc.name)}
+                      >
+                        {deletingDocument === doc.name ? "…" : "Delete"}
+                      </button>
+                    </div>
                   ))}
                 </div>
               )}

@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import json
+import time
+from collections.abc import Callable
 from typing import Any
 
 from openai import OpenAI
 from azure.core.credentials import AzureKeyCredential
-from azure.core.exceptions import ResourceNotFoundError
+from azure.core.exceptions import ResourceNotFoundError, ServiceRequestError
 from azure.search.documents import SearchClient
 from azure.search.documents.indexes import SearchIndexClient
 from azure.search.documents.indexes.models import (
@@ -178,6 +180,47 @@ class AzureServices:
         blob = self.blob.get_container_client(settings.storage_container).get_blob_client(file_name)
         properties = blob.get_blob_properties()
         return blob.download_blob().readall(), properties.content_settings.content_type or "application/octet-stream"
+
+    @staticmethod
+    def _with_retry(operation: Callable[[], Any], attempts: int = 3) -> Any:
+        """Retry transient Azure transport resets with short exponential backoff."""
+        for attempt in range(attempts):
+            try:
+                return operation()
+            except (ConnectionError, ServiceRequestError):
+                if attempt == attempts - 1:
+                    raise
+                time.sleep(0.75 * (2**attempt))
+
+    def delete_document(self, file_name: str) -> int:
+        """Delete one Blob Storage document and all Search chunks that cite it."""
+        if not self.blob:
+            raise ValueError("AZURE_STORAGE_CONNECTION_STRING must be configured.")
+
+        chunks = self._with_retry(
+            lambda: list(
+                self.search.search(
+                    search_text=file_name,
+                    select=["id", "title"],
+                    top=1000,
+                )
+            )
+        )
+        chunk_ids = [chunk["id"] for chunk in chunks if chunk.get("title") == file_name]
+
+        for start in range(0, len(chunk_ids), 500):
+            self._with_retry(
+                lambda: self.search.delete_documents(
+                    documents=[
+                        {"id": chunk_id}
+                        for chunk_id in chunk_ids[start : start + 500]
+                    ]
+                )
+            )
+
+        blob = self.blob.get_container_client(settings.storage_container).get_blob_client(file_name)
+        self._with_retry(lambda: blob.delete_blob(delete_snapshots="include"))
+        return len(chunk_ids)
 
     def upsert_chunks(self, chunks: list[dict[str, Any]]) -> None:
         """Embed document chunks and upload them to Azure AI Search."""

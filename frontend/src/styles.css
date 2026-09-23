@@ -56,10 +56,14 @@ h1 { margin: 15px 0 11px; font-size: clamp(36px, 5vw, 58px); line-height: 1.02; 
 .status-bar span { display: block; height: 100%; background: #59667c; border-radius: inherit; transition: width .3s; }
 .empty-docs { color: #929aaa; font-size: 12px; line-height: 1.55; margin-top: 13px; }
 .doc-list { display: grid; gap: 7px; margin-top: 13px; }
-.doc-item { display: flex; gap: 8px; align-items: center; text-decoration: none; padding: 8px; border-radius: 8px; background: #f7f8fa; color: #424d60; }
+.doc-item { display: flex; gap: 8px; align-items: center; padding: 8px; border-radius: 8px; background: #f7f8fa; color: #424d60; }
 .doc-item:hover { background: #eef1f5; }
+.doc-link { min-width: 0; flex: 1; display: flex; gap: 8px; align-items: center; color: inherit; text-decoration: none; }
 .pdf-label { font-size: 8px; font-weight: 800; color: #7d4b4b; background: #f4dddd; padding: 4px 5px; border-radius: 4px; }
 .doc-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; }
+.delete-document { flex: 0 0 auto; border: 1px solid #e8caca; border-radius: 6px; padding: 5px 7px; background: #fff7f7; color: #9a4d4d; font-size: 9px; font-weight: 750; }
+.delete-document:hover { background: #ffeded; border-color: #d99b9b; }
+.delete-document:disabled { opacity: .55; cursor: default; }
 
 .chat-card { min-width: 0; background: #fff; border: 1px solid #e2e6ed; border-radius: 14px; overflow: hidden; box-shadow: 0 12px 35px rgba(20, 28, 45, .045); }
 .chat-header { min-height: 70px; padding: 15px 18px; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid #e8ebf0; }

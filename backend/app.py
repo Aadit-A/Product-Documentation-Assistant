@@ -128,3 +128,28 @@ def get_document(filename: str) -> Response:
     except Exception as exc:
         raise HTTPException(status_code=404, detail="Document not found.") from exc
     return Response(content=data, media_type=content_type)
+
+
+@app.delete("/api/documents/{filename}")
+def delete_document(filename: str) -> dict:
+    """Delete one Azure Blob document and its indexed Search chunks."""
+    safe_name = Path(filename).name
+    if safe_name != filename:
+        raise HTTPException(status_code=400, detail="Invalid document name.")
+
+    try:
+        deleted_chunks = azure.delete_document(safe_name)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Azure temporarily closed the delete connection. "
+                "Please retry the deletion. Details: " + str(exc)
+            ),
+        ) from exc
+
+    return {
+        "message": "Document and indexed chunks deleted successfully.",
+        "file": safe_name,
+        "deleted_chunks": deleted_chunks,
+    }

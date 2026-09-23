@@ -268,6 +268,18 @@ curl.exe -X POST http://localhost:8000/api/documents `
 
 Streams a source document from Azure Blob Storage through FastAPI. The backend reduces the requested name to its filename component before accessing Blob Storage.
 
+### `DELETE /api/documents/{filename}`
+
+Deletes one source document from Azure Blob Storage and deletes only the Azure AI Search chunks whose `title` matches that filename. The response includes the number of deleted chunks.
+
+```json
+{
+        "message": "Document and indexed chunks deleted successfully.",
+        "file": "manual.pdf",
+        "deleted_chunks": 23
+}
+```
+
 ### `POST /api/chat`
 
 Accepts a question and optional conversation history:
