@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from io import BytesIO
 from pathlib import Path
 from typing import Iterable
 
@@ -17,7 +18,7 @@ SUPPORTED_TEXT = {".txt", ".md"}
 SUPPORTED_DOCUMENTS = {".pdf"}
 
 
-def analyze_pdf(path: Path) -> list[tuple[int, str]]:
+def analyze_pdf(data: bytes) -> list[tuple[int, str]]:
     """
     Analyze a PDF using Azure AI Document Intelligence
     and return page-numbered text.
@@ -40,11 +41,10 @@ def analyze_pdf(path: Path) -> list[tuple[int, str]]:
         ),
     )
 
-    with path.open("rb") as file:
-        poller = client.begin_analyze_document(
-            "prebuilt-layout",
-            body=file,
-        )
+    poller = client.begin_analyze_document(
+        "prebuilt-layout",
+        body=BytesIO(data),
+    )
 
     result = poller.result()
 
@@ -83,7 +83,7 @@ def read_document(path: Path) -> list[tuple[int, str]]:
         return [(1, text)]
 
     if suffix in SUPPORTED_DOCUMENTS:
-        return analyze_pdf(path)
+        return analyze_pdf(path.read_bytes())
 
     raise ValueError(f"Unsupported file type: {path.suffix}")
 
@@ -128,7 +128,7 @@ def page_chunks(
             )
 
 
-def ingest_file(path: Path, azure: AzureServices) -> int:
+def ingest_document(file_name: str, data: bytes, azure: AzureServices) -> int:
     """
     Process one document:
 
@@ -143,11 +143,17 @@ def ingest_file(path: Path, azure: AzureServices) -> int:
     Azure AI Search
     """
 
-    pages = read_document(path)
+    suffix = Path(file_name).suffix.lower()
+    if suffix in SUPPORTED_TEXT:
+        pages = [(1, data.decode("utf-8"))]
+    elif suffix in SUPPORTED_DOCUMENTS:
+        pages = analyze_pdf(data)
+    else:
+        raise ValueError(f"Unsupported file type: {suffix}")
 
     version_match = re.search(
         r"(?:v|version[ _-]*)(\d+(?:\.\d+)*)",
-        path.stem,
+        Path(file_name).stem,
         re.I,
     )
 
@@ -158,15 +164,13 @@ def ingest_file(path: Path, azure: AzureServices) -> int:
     )
 
     category = (
-        path.parent.name
-        if path.parent.name != "data"
-        else "general"
+        "general"
     )
 
     # Store original document in Azure Blob Storage
     source_url = azure.upload_blob(
-        path.name,
-        path.read_bytes(),
+        file_name,
+        data,
     )
 
     chunks = []
@@ -180,7 +184,7 @@ def ingest_file(path: Path, azure: AzureServices) -> int:
     ):
 
         chunk_id = (
-            f"{path.stem.lower().replace(' ', '-')}"
+            f"{Path(file_name).stem.lower().replace(' ', '-')}"
             f"-{page}-{number}"
         )
 
@@ -188,7 +192,7 @@ def ingest_file(path: Path, azure: AzureServices) -> int:
             {
                 "id": chunk_id[:128],
                 "content": content,
-                "title": path.name,
+                "title": file_name,
                 "section": "Product Documentation",
                 "page": page,
                 "version": version,
@@ -205,6 +209,11 @@ def ingest_file(path: Path, azure: AzureServices) -> int:
     azure.upsert_chunks(chunks)
 
     return len(chunks)
+
+
+def ingest_file(path: Path, azure: AzureServices) -> int:
+    """Ingest a local batch source into Azure; web uploads use ingest_document."""
+    return ingest_document(path.name, path.read_bytes(), azure)
 
 
 def ingest_directory(directory: Path) -> int:

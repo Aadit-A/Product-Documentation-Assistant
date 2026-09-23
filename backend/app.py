@@ -2,17 +2,16 @@
 
 from __future__ import annotations
 
-import shutil
 from pathlib import Path
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
 from .azure_services import AzureServices
 from .config import settings
-from .ingest import ingest_file
+from .ingest import ingest_document
 
 app = FastAPI(
     title="Product Documentation Assistant API",
@@ -28,10 +27,6 @@ app.add_middleware(
 )
 
 azure = AzureServices()
-UPLOAD_DIR = Path(__file__).resolve().parents[1] / "data" / "uploads"
-UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-
-
 class Message(BaseModel):
     role: str
     content: str
@@ -55,26 +50,18 @@ def health() -> dict:
         "status": "ok",
         "search": search,
         "indexed_chunks": count,
-        "storage": "azure-blob" if azure.blob else "local-only",
+        "storage": "azure-blob" if azure.blob else "not-configured",
     }
 
 
 @app.get("/api/documents")
 def list_documents() -> dict:
     """List uploaded source documents stored by the application."""
-    files = []
-    for path in sorted(UPLOAD_DIR.iterdir()):
-        if path.is_file() and path.suffix.lower() in {".pdf", ".md", ".txt"}:
-            files.append(
-                {
-                    "name": path.name,
-                    "size": path.stat().st_size,
-                    "url": f"{settings.public_app_url.rstrip('/')}/api/documents/{path.name}",
-                }
-            )
     try:
+        files = azure.list_blobs()
         indexed_chunks = azure.search.get_document_count()
     except Exception:
+        files = []
         indexed_chunks = 0
     return {"documents": files, "indexed_chunks": indexed_chunks}
 
@@ -96,9 +83,12 @@ def chat(request: ChatRequest) -> dict:
 
 
 @app.post("/api/documents")
-async def upload_document(file: UploadFile = File(...)) -> dict:
+async def upload_document(
+    file: bytes = File(...),
+    x_file_name: str = Header(default="document.pdf"),
+) -> dict:
     """Upload a PDF/text document, store it, extract it and index its chunks."""
-    original_name = Path(file.filename or "document").name
+    original_name = Path(x_file_name or "document.pdf").name
     suffix = Path(original_name).suffix.lower()
     if suffix not in {".pdf", ".md", ".txt"}:
         raise HTTPException(
@@ -108,20 +98,16 @@ async def upload_document(file: UploadFile = File(...)) -> dict:
 
     # Keep the filename safe and reasonably predictable.
     safe_name = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in original_name)
-    destination = UPLOAD_DIR / safe_name
-    data = await file.read()
+    data = file
     if not data:
         raise HTTPException(status_code=400, detail="The uploaded file is empty.")
     if len(data) > 25 * 1024 * 1024:
         raise HTTPException(status_code=413, detail="Please upload a file smaller than 25 MB.")
 
-    destination.write_bytes(data)
-
     try:
         azure.ensure_search_index()
-        chunk_count = ingest_file(destination, azure)
+        chunk_count = ingest_document(safe_name, data, azure)
     except Exception as exc:
-        destination.unlink(missing_ok=True)
         raise HTTPException(status_code=500, detail=f"Document processing failed: {exc}") from exc
 
     return {
@@ -134,10 +120,11 @@ async def upload_document(file: UploadFile = File(...)) -> dict:
 
 
 @app.get("/api/documents/{filename}")
-def get_document(filename: str) -> FileResponse:
-    """Serve an uploaded source document for local citation links."""
+def get_document(filename: str) -> Response:
+    """Stream an uploaded source document from Azure Blob Storage."""
     safe_name = Path(filename).name
-    path = UPLOAD_DIR / safe_name
-    if not path.exists():
-        raise HTTPException(status_code=404, detail="Document not found.")
-    return FileResponse(path)
+    try:
+        data, content_type = azure.download_blob(safe_name)
+    except Exception as exc:
+        raise HTTPException(status_code=404, detail="Document not found.") from exc
+    return Response(content=data, media_type=content_type)

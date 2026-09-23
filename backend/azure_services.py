@@ -7,6 +7,7 @@ from typing import Any
 
 from openai import OpenAI
 from azure.core.credentials import AzureKeyCredential
+from azure.core.exceptions import ResourceNotFoundError
 from azure.search.documents import SearchClient
 from azure.search.documents.indexes import SearchIndexClient
 from azure.search.documents.indexes.models import (
@@ -37,6 +38,10 @@ class AzureServices:
             raise ValueError(
                 "AZURE_SEARCH_ENDPOINT and AZURE_SEARCH_API_KEY must be configured in .env."
             )
+        if not settings.storage_connection_string:
+            raise ValueError(
+                "AZURE_STORAGE_CONNECTION_STRING must be configured in .env."
+            )
 
         # Azure OpenAI v1 endpoint. No Azure CLI or DefaultAzureCredential is used.
         self.openai = OpenAI(
@@ -62,7 +67,13 @@ class AzureServices:
         )
 
     def ensure_search_index(self) -> None:
-        """Create/update the vector-enabled Azure AI Search index."""
+        """Create the vector-enabled Search index once, when it is missing."""
+        try:
+            self.search_index.get_index(settings.search_index_name)
+            return
+        except ResourceNotFoundError:
+            pass
+
         fields = [
             SimpleField(name="id", type=SearchFieldDataType.String, key=True),
             SearchableField(
@@ -113,16 +124,20 @@ class AzureServices:
 
     def embed(self, text: str) -> list[float]:
         """Create a 1536-dimensional embedding using the configured deployment."""
+        return self.embed_many([text])[0]
+
+    def embed_many(self, texts: list[str]) -> list[list[float]]:
+        """Create embeddings in batches to reduce Azure OpenAI round trips."""
         response = self.openai.embeddings.create(
             model=settings.azure_openai_embedding_deployment,
-            input=text,
+            input=texts,
         )
-        return response.data[0].embedding
+        return [item.embedding for item in sorted(response.data, key=lambda item: item.index)]
 
     def upload_blob(self, file_name: str, data: bytes) -> str:
-        """Persist an uploaded document in Azure Blob Storage when configured."""
+        """Persist an uploaded document in Azure Blob Storage."""
         if not self.blob:
-            return f"{settings.public_app_url.rstrip('/')}/api/documents/{file_name}"
+            raise ValueError("AZURE_STORAGE_CONNECTION_STRING must be configured.")
 
         container = self.blob.get_container_client(settings.storage_container)
         try:
@@ -137,8 +152,32 @@ class AzureServices:
             overwrite=True,
             content_settings=ContentSettings(content_type=content_type),
         )
-        # Keep citations on the FastAPI URL so they work even when the Blob container is private.
         return f"{settings.public_app_url.rstrip('/')}/api/documents/{file_name}"
+
+    def list_blobs(self) -> list[dict[str, Any]]:
+        """List source documents stored in Azure Blob Storage."""
+        if not self.blob:
+            raise ValueError("AZURE_STORAGE_CONNECTION_STRING must be configured.")
+
+        container = self.blob.get_container_client(settings.storage_container)
+        return [
+            {
+                "name": blob.name,
+                "size": blob.size,
+                "url": f"{settings.public_app_url.rstrip('/')}/api/documents/{blob.name}",
+            }
+            for blob in container.list_blobs()
+            if blob.name.lower().endswith((".pdf", ".md", ".txt"))
+        ]
+
+    def download_blob(self, file_name: str) -> tuple[bytes, str]:
+        """Read a source document from Azure Blob Storage without local persistence."""
+        if not self.blob:
+            raise ValueError("AZURE_STORAGE_CONNECTION_STRING must be configured.")
+
+        blob = self.blob.get_container_client(settings.storage_container).get_blob_client(file_name)
+        properties = blob.get_blob_properties()
+        return blob.download_blob().readall(), properties.content_settings.content_type or "application/octet-stream"
 
     def upsert_chunks(self, chunks: list[dict[str, Any]]) -> None:
         """Embed document chunks and upload them to Azure AI Search."""
@@ -146,8 +185,13 @@ class AzureServices:
             raise ValueError("No readable content was extracted from the document.")
 
         payload = []
-        for chunk in chunks:
-            payload.append({**chunk, "content_vector": self.embed(chunk["content"])})
+        for start in range(0, len(chunks), 64):
+            batch = chunks[start : start + 64]
+            embeddings = self.embed_many([chunk["content"] for chunk in batch])
+            payload.extend(
+                {**chunk, "content_vector": embedding}
+                for chunk, embedding in zip(batch, embeddings)
+            )
 
         for start in range(0, len(payload), 500):
             self.search.upload_documents(documents=payload[start : start + 500])

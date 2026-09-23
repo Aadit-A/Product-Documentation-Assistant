@@ -50,7 +50,11 @@ function App() {
     form.append("file", file);
 
     try {
-      const response = await fetch(`${API}/api/documents`, { method: "POST", body: form });
+      const response = await fetch(`${API}/api/documents`, {
+        method: "POST",
+        headers: { "X-File-Name": file.name },
+        body: form,
+      });
       const data = await response.json();
       if (!response.ok) throw new Error(data.detail || "Upload failed");
       setNotice({ type: "success", text: `${data.file} is ready. ${data.chunks} chunks were indexed.` });
